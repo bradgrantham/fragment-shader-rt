@@ -7,5 +7,5 @@ and "web_models".
 To make a working version of the ray-tracer web page, do the following:
 * clone this repository
 * make web_models
-* python -m SimpleHTTPServer
-* point your WebGL-capable browser at the address printed
+* python -m SimpleHTTPServer # this will print an address
+* point your WebGL-capable browser http://localhost:8000 # replace 8000 with the address from python
