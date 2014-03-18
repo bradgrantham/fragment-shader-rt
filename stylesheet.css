@@ -1,0 +1,43 @@
+body {
+    font-family: arial,helvetica,sans-serif;
+    margin: .5in;
+}
+
+div.pagetitle {
+    font-family: "palatino linotype", "times new roman", times, serif;
+    font-weight: bold;
+    font-size: 300%;
+    font-style: italic;
+    letter-spacing: 5pt;
+    font-variant: small-caps;
+}
+
+div.blockquote {
+    font-family: "arial", helvetica, sans-serif;
+    margin-left: .75in;
+    margin-right: .75in;
+}
+
+h1 {
+    font-family: "arial", helvetica, sans-serif;
+}
+
+h2 {
+    font-family: "arial", helvetica, sans-serif;
+}
+
+h3 {
+    font-family: "arial", helvetica, sans-serif;
+}
+
+div.table {
+    font-family: verdana,arial,helvetica,sans-serif;
+    margin-left: .4in;
+    margin-right: .4in;
+}
+
+div.section {
+    font-family: verdana,arial,helvetica,sans-serif;
+    margin-left: .4in;
+    margin-right: .4in;
+}

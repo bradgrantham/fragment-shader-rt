@@ -1,0 +1,2105 @@
+<!DOCTYPE html>
+
+<!--
+ Copyright 2013-2014, Bradley A. Grantham
+ 
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ 
+      http://www.apache.org/licenses/LICENSE-2.0
+ 
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+
+<html>
+<!--script type="text/javascript" src="dna.js"></script-->
+<link rel="stylesheet" href="//code.jquery.com/ui/1.10.3/themes/smoothness/jquery-ui.css">
+<script src="//code.jquery.com/jquery-1.9.1.js"></script>
+<script src="//code.jquery.com/ui/1.10.3/jquery-ui.js"></script>
+
+<script id="gDecalVertexShaderText" type="x-shader/x-vertex">
+uniform mat4 modelview;
+attribute highp vec4 pos;
+attribute highp vec2 vtex;
+varying highp vec2 ftex;
+
+void main()
+{
+    gl_Position = modelview * pos;
+    ftex = vtex;
+}
+</script>
+
+<script id="gRayTracingFragmentShaderText" type="x-shader/x-fragment">
+precision highp float;
+
+uniform int which;
+uniform int tree_root;
+uniform highp vec4 light_dir;
+uniform highp vec3 eye;
+uniform highp mat4 camera_matrix;
+uniform highp mat4 camera_normal_matrix;
+uniform highp mat4 object_matrix;
+uniform highp mat4 object_inverse;
+uniform highp mat4 object_normal_matrix;
+uniform highp mat4 object_normal_inverse;
+uniform float aspect;
+uniform float fov;
+uniform highp vec3 background_color;
+uniform sampler2D sphere_geometry;
+uniform int sphere_data_row_size;
+uniform int sphere_data_rows;
+uniform sampler2D sphere_colors;
+uniform int group_data_row_size;
+uniform int group_data_rows;
+uniform sampler2D group_boxmin;
+uniform sampler2D group_boxmax;
+uniform sampler2D group_children;
+uniform sampler2D group_objects;
+uniform sampler2D group_hitmiss;
+
+varying highp vec2 ftex;
+
+struct ray {
+    highp vec4 o;
+    highp vec4 d;
+};
+
+struct surface_hit
+{
+    highp float t;
+    int which;
+    vec3 color;
+};
+
+const float infinitely_far = 10000000.0;
+
+surface_hit surface_hit_init(vec3 background_color)
+{
+    return surface_hit(infinitely_far, -1, background_color);
+}
+
+void set_bad_hit(inout surface_hit hit, float r, float g, float b)
+{
+    hit.color = vec3(r, g, b);
+    hit.t = 1.0;
+}
+
+struct range
+{
+    float t0, t1;
+};
+
+range range_full()
+{
+    return range(-100000000.0, 100000000.0);
+}
+
+range range_intersect(in range r1, in range r2)
+{
+    float t0 = max(r1.t0, r2.t0);
+    float t1 = min(r1.t1, r2.t1);
+    return range(t0, t1);
+}
+
+bool range_is_empty(in range r)
+{
+    return r.t0 >= r.t1;
+}
+
+const float NO_t = -1.0;
+
+range box_intersect(in highp vec3 boxmin, in highp vec3 boxmax, in ray theray)
+{
+    // XXX w ignored
+
+    range r = range_full();
+
+    float t0, t1;
+
+    t0 = (boxmin.x - theray.o.x) / theray.d.x;
+    t1 = (boxmax.x - theray.o.x) / theray.d.x;
+    if(theray.d.x >= 0.0)
+        r = range_intersect(r, range(t0, t1));
+    else
+        r = range_intersect(r, range(t1, t0));
+
+    t0 = (boxmin.y - theray.o.y) / theray.d.y;
+    t1 = (boxmax.y - theray.o.y) / theray.d.y;
+    if(theray.d.y >= 0.0)
+        r = range_intersect(r, range(t0, t1));
+    else
+        r = range_intersect(r, range(t1, t0));
+
+    t0 = (boxmin.z - theray.o.z) / theray.d.z;
+    t1 = (boxmax.z - theray.o.z) / theray.d.z;
+    if(theray.d.z >= 0.0)
+        r = range_intersect(r, range(t0, t1));
+    else
+        r = range_intersect(r, range(t1, t0));
+
+    return r;
+}
+
+range sphere_intersect(in highp vec3 center, in float radius, in ray theray)
+{
+    // XXX w ignored
+    highp vec3 diff = theray.o.xyz - center;
+
+    float b = 2.0 * dot(theray.d.xyz, diff);
+
+    float radicand = b * b - 4.0 * (dot(diff, diff) - radius * radius);
+
+    if(radicand < 0.0)
+        return range(100000000.0, -100000000.0);
+
+    float t0 = (-b - sqrt(radicand)) / 2.0;
+    float t1 = (-b + sqrt(radicand)) / 2.0;
+    return range(t0, t1);
+}
+
+float sphere_intersect(in highp vec3 center, in float radius, in ray theray, in range r)
+{
+    // XXX w ignored
+    highp vec3 diff = theray.o.xyz - center;
+
+    float b = 2.0 * dot(theray.d.xyz, diff);
+
+    float radicand = b * b - 4.0 * (dot(diff, diff) - radius * radius);
+    if(radicand < 0.0)
+        return NO_t;
+
+    float t1 = (-b + sqrt(radicand)) / 2.0;
+
+    if(t1 < r.t0)
+         return NO_t;
+
+    float t0 = (-b - sqrt(radicand)) / 2.0;
+
+    if(t0 > r.t1)
+        return NO_t;
+
+    if(t0 < r.t0)
+        return t1;
+
+    return t0;
+}
+
+struct group {
+    bool is_branch;
+    int g1, g2;
+    int start, count;
+    highp vec3 boxmin;
+    highp vec3 boxmax;
+    int hit_next, miss_next;
+};
+
+group get_group(int which)
+{
+    group g;
+
+    int j = which / group_data_row_size;
+    int i = which - j * group_data_row_size;
+    highp vec2 sample = vec2((float(i) + 0.25) / float(group_data_row_size), (float(j) + 0.25) / float(group_data_rows));
+
+    g.boxmin = texture2D(group_boxmin, sample).xyz;
+    g.boxmax = texture2D(group_boxmax, sample).xyz;
+
+    highp vec2 group_child = texture2D(group_children, sample).xy;
+    g.g1 = int(group_child.x);
+    g.g2 = int(group_child.y);
+
+    highp vec2 group_next = texture2D(group_hitmiss, sample).xy;
+    g.hit_next = int(group_next.x);
+    g.miss_next = int(group_next.y);
+
+    highp vec2 group_object = texture2D(group_objects, sample).xy;
+    g.start = int(group_object.x);
+    g.count = int(group_object.y);
+
+    g.is_branch = (g.count == 0);
+
+    return g;
+}
+
+range group_bounds_intersect(in group g, in ray theray)
+{
+    return box_intersect(g.boxmin, g.boxmax, theray);
+}
+
+void sphere_intersect(int which, in ray theray, in range r, inout surface_hit hit)
+{
+    int j = which / sphere_data_row_size;
+    int i = which - j * sphere_data_row_size;
+    highp vec2 sample = vec2((float(i) + 0.25) / float(sphere_data_row_size), (float(j) + 0.25) / float(sphere_data_rows));
+
+    highp vec4 sphere = texture2D(sphere_geometry, sample);
+    highp vec3 center = sphere.xyz;
+    float radius = sphere.w;
+
+    float t = sphere_intersect(center, radius, theray, r);
+
+    if(t == NO_t)
+        return;
+
+    if(t > hit.t)
+        return;
+
+    hit.which = which;
+    hit.t = t;
+}
+
+void shade(in surface_hit hit, in ray theray, out highp vec4 normal, out highp vec4 point, out vec3 color)
+{
+    if(hit.which < 0) {
+        color = hit.color;
+        normal = vec4(0, 0, -1, 0);
+        point = vec4(0, 0, 0, 1);
+    } else {
+        int j = hit.which / sphere_data_row_size;
+        int i = hit.which - j * sphere_data_row_size;
+        highp vec2 sample = vec2((float(i) + 0.25) / float(sphere_data_row_size), (float(j) + 0.25) / float(sphere_data_rows));
+
+        highp vec4 sphere = texture2D(sphere_geometry, sample);
+        highp vec4 center = vec4(sphere.x, sphere.y, sphere.z, 1.0);
+        float radius = sphere.w;
+
+        /*  snap to sphere surface */
+        highp vec4 point0 = theray.o + theray.d * hit.t;
+        highp vec4 to_surface = point0 - center;
+        float distance = length(to_surface);
+
+        point = center + to_surface * (radius / distance);
+        normal = to_surface / radius;
+        color = texture2D(sphere_colors, sample).xyz;
+    }
+}
+
+/* 400 seems enough for the sorting pump */
+/* limit to 200 for Windows Chrome < 30 */
+const int max_bvh_iterations = 400;
+const int max_leaf_tests = 8;
+
+void group_intersect(int root, in ray theray, in range prevr, inout surface_hit hit)
+{
+    int g = root;
+
+    for(int i = 0; i < max_bvh_iterations; i++) {
+        group gg = get_group(g);
+
+        range r = range_intersect(prevr, group_bounds_intersect(gg, theray));
+
+        if((!range_is_empty(r)) && (r.t0 < hit.t)) {
+	    //  max 8 spheres in leaf, but limit on BVH depth
+	    //  takes precedence so could be fat leaves at max
+	    //  depth, need to carefully only make web scenes with
+	    //  8 or fewer spheres at leaf
+	    for(int j = 0; j < max_leaf_tests; j++) {
+		if(j >= gg.count)
+		    break;
+		sphere_intersect(gg.start + j, theray, r, hit);
+	    }
+            g = gg.hit_next;
+        } else {
+            g = gg.miss_next;
+        }
+
+        if(g >= 0xffff)
+            return;
+        if(i == max_bvh_iterations - 1)
+            set_bad_hit(hit, 1.0, 1.0, 0.0);
+    }
+}
+
+highp vec3 eye_ray(highp float u, highp float v, highp float aspect, highp float fov)
+{
+    highp float eye_alpha = fov * (u - 0.5);
+    highp float eye_beta = fov * (v - 0.5) * aspect;
+
+    /* eye space ray */
+    highp vec3 eye;
+    eye.x = sin(eye_alpha) * cos(eye_beta);
+    eye.y = sin(eye_beta);
+    eye.z = cos(eye_alpha) * cos(eye_beta);
+
+    // The above functions *should* return a normalized vector.
+    // On integrated GPU (Intel) on MacOS X, it doesn't.  So normalize
+    // here to avoid artifacts due to low-precision trig functions
+    return normalize(eye);
+}
+
+const bool cast_shadows = true;
+
+void transform(in ray r, in mat4 matrix, in mat4 normal_matrix, out ray t)
+{
+    t.o = matrix * r.o;
+    t.d = normal_matrix * r.d;
+}
+
+bool do_one_whitted(in ray worldray, out vec3 result, out ray reflected)
+{
+    surface_hit shading = surface_hit_init(background_color);
+
+    ray objectray;
+    transform(worldray, object_matrix, object_normal_matrix, objectray);
+
+    group_intersect(tree_root, objectray, range(0.0, 100000000.0), shading);
+
+    if(shading.t >= infinitely_far) {
+
+        result = background_color;
+        return false;
+
+    } else {
+
+        vec3 color;
+        highp vec4 object_normal, object_point;
+        shade(shading, objectray, object_normal, object_point, color);
+
+        highp vec4 world_normal, world_point;
+        world_normal = object_normal_inverse * object_normal;
+        world_point = object_inverse * object_point;
+
+	ray world_shadowray;
+	ray object_shadowray;
+
+	world_shadowray.o = world_point + world_normal * 0.0001;
+	world_shadowray.d = vec4(light_dir.x, light_dir.y, light_dir.z, 0);
+	surface_hit shadow_hit = surface_hit_init(vec3(0.0, 0.0, 0.0));
+        transform(world_shadowray, object_matrix, object_normal_matrix, object_shadowray);
+	group_intersect(tree_root, object_shadowray, range(0.0, 100000000.0), shadow_hit);
+
+        if(shadow_hit.t < infinitely_far) {
+            result = color * 0.1;
+        } else {
+            float diffuse = max(0.1, dot(world_normal, light_dir));
+            result = color * diffuse;
+        }
+
+        reflected.o = world_point + world_normal * .0001;
+        reflected.d = reflect(worldray.d, world_normal);
+        return true;
+    }
+}
+
+const int bounce_count = 2;
+
+void main()
+{
+    ray eyeray, worldray, objectray;
+
+    eyeray.d.xyz = eye_ray(ftex.x, 1.0 - ftex.y, aspect, fov);
+    eyeray.d.w = 0.0;
+    eyeray.o = vec4(0.0, 0.0, 0.0, 1.0);
+
+    transform(eyeray, camera_matrix, camera_normal_matrix, worldray);
+
+    vec3 result = vec3(0, 0, 0);
+    float intensity = 1.0;
+    for(int i = 0; i < bounce_count; i++) {
+        ray reflected;
+        vec3 color;
+        bool hit_something = do_one_whitted(worldray, color, reflected);
+        result += color * intensity;
+        if(!hit_something)
+            break;
+        intensity *= .5;
+        worldray = reflected;
+    }
+
+    gl_FragColor = vec4(result.r, result.g, result.b, 1);
+}
+</script>
+
+<script type="text/javascript">
+<!--
+
+// This function adapted from getShader at http://learningwebgl.com/blog/?p=28
+function getScriptText(id)
+{
+    var shaderScript = document.getElementById(id)
+    if (!shaderScript) {
+        return null
+    }
+
+    var str = ""
+    var k = shaderScript.firstChild
+    while (k) {
+        if (k.nodeType == 3)
+            str += k.textContent
+        k = k.nextSibling
+    }
+    return str
+}
+
+function debug(s)
+{
+    $("debug").append("<code>" + s + "</code>" + "<br>")
+}
+
+function to_radians(d)
+{
+    return d / 180 * 3.141596
+}
+
+function vec3(x, y, z)
+{
+    var v = {}
+    v.X = x
+    v.Y = y
+    v.Z = z
+    return v
+}
+
+function vec4(x, y, z, w)
+{
+    var v = {}
+    v.X = x
+    v.Y = y
+    v.Z = z
+    v.W = w
+    return v
+}
+
+function vec3_subtract(v1, v2)
+{
+    return vec3(v1.X - v2.X, v1.Y - v2.Y, v1.Z - v2.Z)
+}
+
+function vec3_add(v1, v2)
+{
+    return vec3(v1.X + v2.X, v1.Y + v2.Y, v1.Z + v2.Z)
+}
+
+function vec3_divide(v, d)
+{
+    return vec3(v.X / d, v.Y / d, v.Z / d)
+}
+
+function vec3_multiply(v, d)
+{
+    return vec3(v.X * d, v.Y * d, v.Z * d)
+}
+
+function vec3_dot(v1, v2)
+{
+    return v1.X * v2.X + v1.Y * v2.Y + v1.Z * v2.Z
+}
+
+function mat4_mult_vec4(m, v)
+{
+    var t = [0, 0, 0, 0]
+
+    for(i = 0; i < 4; i++)
+	t[i] =
+	    m[0 + i] * v.X + 
+	    m[4 + i] * v.Y + 
+	    m[8 + i] * v.Z + 
+	    m[12 + i] * v.W
+
+    return vec4(t[0], t[1], t[2], t[3])
+}
+
+function mat4_make_identity()
+{
+    return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+}
+
+function mat4_determinant(mat)
+{
+    return (mat[0] * mat[5] - mat[1] * mat[4]) *
+        (mat[10] * mat[15] - mat[11] * mat[14]) + 
+        (mat[2] * mat[4] - mat[0] * mat[6]) *
+	(mat[9] * mat[15] - mat[11] * mat[13]) + 
+        (mat[0] * mat[7] - mat[3] * mat[4]) *
+	(mat[9] * mat[14] - mat[10] * mat[13]) + 
+        (mat[1] * mat[6] - mat[2] * mat[5]) *
+	(mat[8] * mat[15] - mat[11] * mat[12]) + 
+        (mat[3] * mat[5] - mat[1] * mat[7]) *
+	(mat[8] * mat[14] - mat[10] * mat[12]) + 
+        (mat[2] * mat[7] - mat[3] * mat[6]) *
+	(mat[8] * mat[13] - mat[9] * mat[12])
+}
+
+function mat4_transpose(mat)
+{
+    var result = mat4_make_identity()
+
+    for(i = 0; i < 4; i++)
+	for(j = 0; j < 4; j++) 
+	    result[i + j * 4] = mat[j + i *4] 
+
+    return result
+}
+
+function mat4_copy(m)
+{
+    return [m[0], m[1], m[2], m[3],
+       m[4], m[5], m[6], m[7],
+       m[8], m[9], m[10], m[11],
+       m[12], m[13], m[14], m[15]]
+}
+
+function mat4_invert(mat)
+{
+    var EPSILON = .00001
+
+    var hold = mat4_copy(mat)
+    var inv = mat4_make_identity()
+    var det = mat4_determinant(mat)
+    if(Math.abs(det) < EPSILON) /* singular? */ {
+        debug("singular")
+	return
+    }
+
+    var rswap = 0
+    /* this loop isn't entered unless [0 + 0] > EPSILON and det > EPSILON,
+	 so rswap wouldn't be 0, but I initialize so as not to get warned */
+    if(Math.abs(hold[0]) < EPSILON)
+    {
+        if(Math.abs(hold[1]) > EPSILON)
+            rswap = 1
+        else if(Math.abs(hold[2]) > EPSILON)
+	    rswap = 2
+        else if(Math.abs(hold[3]) > EPSILON)
+	    rswap = 3
+
+        for(i = 0; i < 4; i++)
+	{
+            swap = hold[i * 4 + 0]
+            hold[i * 4 + 0] = hold[i * 4 + rswap]
+            hold[i * 4 + rswap] = swap
+
+            swap = inv[i * 4 + 0]
+            inv[i * 4 + 0] = inv[i * 4 + rswap]
+            inv[i * 4 + rswap] = swap
+        }
+    }
+        
+    div = hold[0]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 0] /= div
+        inv[i * 4 + 0] /= div
+    }
+
+    div = hold[1]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 1] -= div * hold[i * 4 + 0]
+        inv[i * 4 + 1] -= div * inv[i * 4 + 0]
+    }
+    div = hold[2]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 2] -= div * hold[i * 4 + 0]
+        inv[i * 4 + 2] -= div * inv[i * 4 + 0]
+    }
+    div = hold[3]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 3] -= div * hold[i * 4 + 0]
+        inv[i * 4 + 3] -= div * inv[i * 4 + 0]
+    }
+
+    if(Math.abs(hold[5]) < EPSILON){
+        if(Math.abs(hold[6]) > EPSILON)
+	    rswap = 2
+        else if(Math.abs(hold[7]) > EPSILON)
+	    rswap = 3
+
+        for(i = 0; i < 4; i++)
+	{
+            swap = hold[i * 4 + 1]
+            hold[i * 4 + 1] = hold[i * 4 + rswap]
+            hold[i * 4 + rswap] = swap
+
+            swap = inv[i * 4 + 1]
+            inv[i * 4 + 1] = inv[i * 4 + rswap]
+            inv[i * 4 + rswap] = swap
+        }
+    }
+
+    div = hold[5]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 1] /= div
+        inv[i * 4 + 1] /= div
+    }
+
+    div = hold[4]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 0] -= div * hold[i * 4 + 1]
+        inv[i * 4 + 0] -= div * inv[i * 4 + 1]
+    }
+    div = hold[6]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 2] -= div * hold[i * 4 + 1]
+        inv[i * 4 + 2] -= div * inv[i * 4 + 1]
+    }
+    div = hold[7]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 3] -= div * hold[i * 4 + 1]
+        inv[i * 4 + 3] -= div * inv[i * 4 + 1]
+    }
+
+    if(Math.abs(hold[10]) < EPSILON){
+        for(i = 0; i < 4; i++)
+	{
+            swap = hold[i * 4 + 2]
+            hold[i * 4 + 2] = hold[i * 4 + 3]
+            hold[i * 4 + 3] = swap
+
+            swap = inv[i * 4 + 2]
+            inv[i * 4 + 2] = inv[i * 4 + 3]
+            inv[i * 4 + 3] = swap
+        }
+    }
+
+    div = hold[10]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 2] /= div
+        inv[i * 4 + 2] /= div
+    }
+
+    div = hold[8]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 0] -= div * hold[i * 4 + 2]
+        inv[i * 4 + 0] -= div * inv[i * 4 + 2]
+    }
+    div = hold[9]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 1] -= div * hold[i * 4 + 2]
+        inv[i * 4 + 1] -= div * inv[i * 4 + 2]
+    }
+    div = hold[11]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 3] -= div * hold[i * 4 + 2]
+        inv[i * 4 + 3] -= div * inv[i * 4 + 2]
+    }
+
+    div = hold[15]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 3] /= div
+        inv[i * 4 + 3] /= div
+    }
+
+    div = hold[12]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 0] -= div * hold[i * 4 + 3]
+        inv[i * 4 + 0] -= div * inv[i * 4 + 3]
+    }
+    div = hold[13]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 1] -= div * hold[i * 4 + 3]
+        inv[i * 4 + 1] -= div * inv[i * 4 + 3]
+    }
+    div = hold[14]
+    for(i = 0; i < 4; i++)
+    {
+        hold[i * 4 + 2] -= div * hold[i * 4 + 3]
+        inv[i * 4 + 2] -= div * inv[i * 4 + 3]
+    }
+    
+    return inv
+}
+
+function mat4_make_translation(x, y, z)
+{
+    var matrix = mat4_make_identity()
+    matrix[12] = x
+    matrix[13] = y
+    matrix[14] = z
+    return matrix
+}
+
+function mat4_make_scale(x, y, z)
+{
+    var matrix = mat4_make_identity()
+    matrix[0] = x
+    matrix[5] = y
+    matrix[10] = z
+    return matrix
+}
+
+function mat4_mult(m1, m2)
+{
+    var t = mat4_make_identity()
+
+    for(j = 0; j < 4; j++)
+	for(i = 0; i < 4; i++)
+           t[i * 4 + j] = m1[i * 4 + 0] * m2[0 * 4 + j] +
+	       m1[i * 4 + 1] * m2[1 * 4 + j] +
+	       m1[i * 4 + 2] * m2[2 * 4 + j] +
+	       m1[i * 4 + 3] * m2[3 * 4 + j]
+
+    return t
+}
+
+function mat4_get_rotation(m)
+{
+    var cosine = (m[0] + m[5] + m[10] - 1.0) / 2.0
+
+    if(cosine > 1.0){
+	cosine = 1.0
+    }
+    if(cosine < -1.0){
+	cosine = -1.0
+    }
+
+    var r = [0, 0, 0, 1]
+
+    r[0] = Math.acos(cosine)
+
+    r[1] = (m[6] - m[9])
+    r[2] = (m[8] - m[2])
+    r[3] = (m[1] - m[4])
+
+    var d = Math.sqrt(r[1] * r[1] +
+	r[2] * r[2] +
+	r[3] * r[3])
+
+    r[1] /= d
+    r[2] /= d
+    r[3] /= d
+
+    return r
+}
+
+function mat4_make_rotation(a, x, y, z)
+{
+    var c = Math.cos(a)
+    var s = Math.sin(a)
+    var t = 1.0 - c
+
+    var matrix = mat4_make_identity()
+
+    matrix[0] = t * x * x + c
+    matrix[1] = t * x * y + s * z
+    matrix[2] = t * x * z - s * y
+    matrix[3] = 0
+
+    matrix[4] = t * x * y - s * z
+    matrix[5] = t * y * y + c
+    matrix[6] = t * y * z + s * x
+    matrix[7] = 0
+
+    matrix[8] = t * x * z + s * y
+    matrix[9] = t * y * z - s * x
+    matrix[10] = t * z * z + c
+    matrix[11] = 0
+
+    matrix[12] = 0
+    matrix[13] = 0
+    matrix[14] = 0
+    matrix[15] = 1
+
+    return matrix
+}
+
+function rotation_mult_rotation(rotation1, rotation2)
+{
+    var matrix1 = mat4_make_rotation(rotation1[0], rotation1[1], rotation1[2],
+        rotation1[3])
+    var matrix2 = mat4_make_rotation(rotation2[0], rotation2[1], rotation2[2],
+        rotation2[3])
+    var matrix3 = mat4_mult(matrix2, matrix1)
+    return mat4_get_rotation(matrix3)
+}
+
+function drag_to_rotation(dx, dy)
+{
+    /* XXX grantham 990825 - this "dist" doesn't make me confident. */
+    /* but I put in the *10000 to decrease chance of underflow  (???) */
+    var dist = Math.sqrt(dx * 10000 * dx * 10000 + dy * 10000 * dy * 10000) / 10000
+    /* dist = sqrt(dx * dx + dy * dy) */
+
+    var rotation = [Math.PI * dist, dy / dist, dx / dist, 0.0]
+    return rotation
+}
+
+function trackball_motion(prevrotation, dx, dy)
+{
+    var rotation = drag_to_rotation(dx, dy)
+    var newrotation = rotation_mult_rotation(prevrotation, rotation)
+    return newrotation
+}
+
+zoom = 1.0
+
+light_dir = vec3(0, 0, -1)
+light_rotation = [0, 0, 0, 1]
+
+object_rotation = [0, 0, 0, 1]
+object_position = vec3(0, 0, 0)
+
+function create_camera_matrix(viewpoint, yaw, pitch, roll, scene_data)
+{
+    var matrix = mat4_make_identity()
+
+    /* rotate around Z to roll */
+    var roll_matrix = mat4_make_rotation(roll, 0, 0, 1)
+    matrix = mat4_mult(roll_matrix, matrix)
+
+    /* rotate around X to pitch */
+    var pitch_matrix = mat4_make_rotation(pitch, 1, 0, 0)
+    matrix = mat4_mult(pitch_matrix, matrix)
+
+    /* rotate around Y to yaw */
+    var yaw_matrix = mat4_make_rotation(yaw, 0, 1, 0)
+    matrix = mat4_mult(yaw_matrix, matrix)
+
+    var viewpoint_matrix = mat4_make_translation(-viewpoint.X, -viewpoint.Y, -viewpoint.Z)
+    var camera_matrix = mat4_mult(viewpoint_matrix, matrix)
+    var camera_inverse = mat4_invert(camera_matrix)
+    var camera_normal_matrix = mat4_transpose(camera_inverse)
+    camera_normal_matrix[3] = 0.0
+    camera_normal_matrix[7] = 0.0
+    camera_normal_matrix[11] = 0.0
+
+    scene_data.camera_matrix = new Float32Array(camera_matrix)
+    scene_data.camera_normal_matrix = new Float32Array(camera_normal_matrix)
+}
+
+function create_object_matrix(center, rotation, position, scene_data)
+{
+    var matrix = mat4_make_rotation(rotation[0], rotation[1], rotation[2], rotation[3])
+    var m2 = mat4_make_translation(center[0] + position.X, center[1] + position.Y, center[2] + position.Z)
+    var object_matrix = mat4_mult(matrix, m2)
+
+    var object_inverse = mat4_invert(object_matrix)
+
+    var object_transpose = mat4_transpose(matrix)
+    var object_normal_matrix = mat4_invert(object_transpose)
+    object_normal_matrix[3] = 0.0
+    object_normal_matrix[7] = 0.0
+    object_normal_matrix[11] = 0.0
+
+    var object_normal_inverse = mat4_transpose(object_matrix)
+    object_normal_inverse[3] = 0.0
+    object_normal_inverse[7] = 0.0
+    object_normal_inverse[11] = 0.0
+
+    scene_data.object_matrix = new Float32Array(object_matrix)
+    scene_data.object_inverse = new Float32Array(object_inverse)
+    scene_data.object_normal_matrix = new Float32Array(object_normal_matrix)
+    scene_data.object_normal_inverse = new Float32Array(object_normal_inverse)
+}
+
+function update_light()
+{
+    var l1 = vec4(0, 0, -1, 0)
+    var light_matrix = mat4_make_rotation(light_rotation[0], light_rotation[1], light_rotation[2], light_rotation[3])
+    var l2 = mat4_mult_vec4(light_matrix, l1)
+
+    light_dir.X = l2.X
+    light_dir.Y = l2.Y
+    light_dir.Z = l2.Z
+}
+
+function update_view_params(scene_data, zoom)
+{
+    var offset = vec3(0, 0, zoom * scene_data.scene_extent / 2 / Math.sin(scene_data.fov / 2))
+
+    scene_data.eye = vec3_subtract(scene_data.scene_center, offset)
+
+    create_camera_matrix(offset, 0, 0, 0, scene_data)
+
+    create_object_matrix(scene_data.scene_center, object_rotation, object_position, scene_data)
+}
+
+gRayTracingFragmentShaderText = getScriptText("gRayTracingFragmentShaderText")
+
+gDecalVertexShaderText = getScriptText("gDecalVertexShaderText")
+
+function init_decal_geometry(gl, raytracer)
+{
+    verts = []
+    verts[0 * 4 + 0] = -1.0
+    verts[0 * 4 + 1] = -1.0
+    verts[0 * 4 + 2] = 0.0
+    verts[0 * 4 + 3] = 1.0
+    verts[1 * 4 + 0] = 1.0
+    verts[1 * 4 + 1] = -1.0
+    verts[1 * 4 + 2] = 0.0
+    verts[1 * 4 + 3] = 1.0
+    verts[2 * 4 + 0] = -1.0
+    verts[2 * 4 + 1] = 1.0
+    verts[2 * 4 + 2] = 0.0
+    verts[2 * 4 + 3] = 1.0
+    verts[3 * 4 + 0] = 1.0
+    verts[3 * 4 + 1] = 1.0
+    verts[3 * 4 + 2] = 0.0
+    verts[3 * 4 + 3] = 1.0
+    raytracer.verts = new Float32Array(verts)
+
+    texcoords = []
+    texcoords[0 * 2 + 0] = 0.0
+    texcoords[0 * 2 + 1] = 1.0
+    texcoords[1 * 2 + 0] = 1.0
+    texcoords[1 * 2 + 1] = 1.0
+    texcoords[2 * 2 + 0] = 0.0
+    texcoords[2 * 2 + 1] = 0.0
+    texcoords[3 * 2 + 0] = 1.0
+    texcoords[3 * 2 + 1] = 0.0
+    raytracer.texcoords = new Float32Array(texcoords)
+
+    raytracer.vert_buffer = gl.createBuffer()
+    raytracer.texcoord_buffer = gl.createBuffer()
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, raytracer.vert_buffer)
+    gl.bufferData(gl.ARRAY_BUFFER, raytracer.verts, gl.STATIC_DRAW)
+    gl.vertexAttribPointer(raytracer.pos_attrib, 4, gl.FLOAT, gl.FALSE, 0, 0)
+    gl.enableVertexAttribArray(raytracer.pos_attrib)
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, raytracer.texcoord_buffer)
+    gl.bufferData(gl.ARRAY_BUFFER, raytracer.texcoords, gl.STATIC_DRAW)
+    gl.vertexAttribPointer(raytracer.texcoord_attrib, 2, gl.FLOAT, gl.FALSE, 0, 0)
+    gl.enableVertexAttribArray(raytracer.texcoord_attrib)
+}
+
+
+// Shader loading function boilerplate borrowed from https://sites.google.com/site/progyumming/javascript/shortest-webgl
+
+function load_shaders(gl, raytracer)
+{
+    raytracer.vertex_shader = gl.createShader(gl.VERTEX_SHADER)
+    gl.shaderSource(raytracer.vertex_shader, gDecalVertexShaderText)
+    gl.compileShader(raytracer.vertex_shader)
+    if (!gl.getShaderParameter(raytracer.vertex_shader, gl.COMPILE_STATUS)) {
+        debug("Could not compile vertex shader:\n\n" + gl.getShaderInfoLog(raytracer.vertex_shader))
+        return false
+    }
+
+    raytracer.fragment_shader = gl.createShader(gl.FRAGMENT_SHADER)
+    gl.shaderSource(raytracer.fragment_shader, gRayTracingFragmentShaderText)
+    gl.compileShader(raytracer.fragment_shader)
+    if (!gl.getShaderParameter(raytracer.fragment_shader, gl.COMPILE_STATUS)) {
+        debug("Could not compile fragment shader:\n\n" + gl.getShaderInfoLog(raytracer.fragment_shader))
+        return false
+    }
+
+    raytracer.program = gl.createProgram()
+    gl.attachShader(raytracer.program, raytracer.vertex_shader)
+    gl.attachShader(raytracer.program, raytracer.fragment_shader)
+
+    raytracer.pos_attrib = 0
+    raytracer.texcoord_attrib = 1
+
+    gl.bindAttribLocation(raytracer.program, raytracer.pos_attrib, "pos")
+    gl.bindAttribLocation(raytracer.program, raytracer.texcoord_attrib, "vtex")
+
+    gl.linkProgram(raytracer.program)
+    if(!gl.getProgramParameter(raytracer.program, gl.LINK_STATUS)) {
+        debug("Could not link:\n" + gl.getProgramInfoLog(raytracer.program))
+        return false
+    }
+    return true
+}
+
+function create_data_texture(gl, raytracer)
+{
+    var texture = gl.createTexture()
+
+    gl.bindTexture(gl.TEXTURE_2D, texture)
+
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+
+    return texture
+}
+
+function init_raytracing_program(gl)
+{
+    raytracer = {}
+    if(!load_shaders(gl, raytracer))
+	return false
+
+    gl.useProgram(raytracer.program)
+
+    raytracer.modelview_uniform = gl.getUniformLocation(raytracer.program, "modelview")
+
+    raytracer.sphere_geometry_uniform = gl.getUniformLocation(raytracer.program, "sphere_geometry")
+    raytracer.sphere_colors_uniform = gl.getUniformLocation(raytracer.program, "sphere_colors")
+
+    raytracer.group_children_uniform = gl.getUniformLocation(raytracer.program, "group_children")
+    raytracer.group_objects_uniform = gl.getUniformLocation(raytracer.program, "group_objects")
+    raytracer.group_hitmiss_uniform = gl.getUniformLocation(raytracer.program, "group_hitmiss")
+    raytracer.group_boxmin_uniform = gl.getUniformLocation(raytracer.program, "group_boxmin")
+    raytracer.group_boxmax_uniform = gl.getUniformLocation(raytracer.program, "group_boxmax")
+
+    raytracer.sphere_data_row_size_uniform = gl.getUniformLocation(raytracer.program, "sphere_data_row_size")
+    raytracer.sphere_data_rows_uniform = gl.getUniformLocation(raytracer.program, "sphere_data_rows")
+    raytracer.group_data_row_size_uniform = gl.getUniformLocation(raytracer.program, "group_data_row_size")
+    raytracer.group_data_rows_uniform = gl.getUniformLocation(raytracer.program, "group_data_rows")
+    raytracer.which_uniform = gl.getUniformLocation(raytracer.program, "which")
+    raytracer.tree_root_uniform = gl.getUniformLocation(raytracer.program, "tree_root")
+    raytracer.light_dir_uniform = gl.getUniformLocation(raytracer.program, "light_dir")
+    raytracer.eye_uniform = gl.getUniformLocation(raytracer.program, "eye")
+    raytracer.camera_matrix_uniform = gl.getUniformLocation(raytracer.program, "camera_matrix")
+    raytracer.camera_normal_matrix_uniform = gl.getUniformLocation(raytracer.program, "camera_normal_matrix")
+    raytracer.object_matrix_uniform = gl.getUniformLocation(raytracer.program, "object_matrix")
+    raytracer.object_inverse_uniform = gl.getUniformLocation(raytracer.program, "object_inverse")
+    raytracer.object_normal_matrix_uniform = gl.getUniformLocation(raytracer.program, "object_normal_matrix")
+    raytracer.object_normal_inverse_uniform = gl.getUniformLocation(raytracer.program, "object_normal_inverse")
+    raytracer.fov_uniform = gl.getUniformLocation(raytracer.program, "fov")
+    raytracer.aspect_uniform = gl.getUniformLocation(raytracer.program, "aspect")
+    raytracer.background_color_uniform = gl.getUniformLocation(raytracer.program, "background_color")
+
+    init_decal_geometry(gl, raytracer)
+
+    raytracer.sphere_geometry_texture = create_data_texture(gl, raytracer)
+    raytracer.sphere_colors_texture = create_data_texture(gl, raytracer)
+    raytracer.group_children_texture = create_data_texture(gl, raytracer)
+    raytracer.group_objects_texture = create_data_texture(gl, raytracer)
+    raytracer.group_hitmiss_texture = create_data_texture(gl, raytracer)
+    raytracer.group_boxmin_texture = create_data_texture(gl, raytracer)
+    raytracer.group_boxmax_texture = create_data_texture(gl, raytracer)
+
+    return raytracer
+}
+
+function load_scene_data(scene_data, gl, raytracer)
+{
+    gl.useProgram(raytracer.program)
+
+    gl.bindTexture(gl.TEXTURE_2D, raytracer.sphere_geometry_texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, scene_data.row_pad, scene_data.sphere_data_rows, 0, gl.RGBA, gl.FLOAT, scene_data.sphere_geometries)
+
+    gl.bindTexture(gl.TEXTURE_2D, raytracer.sphere_colors_texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, scene_data.row_pad, scene_data.sphere_data_rows, 0, gl.RGB, gl.FLOAT, scene_data.sphere_colors)
+
+    gl.bindTexture(gl.TEXTURE_2D, raytracer.group_children_texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, scene_data.row_pad, scene_data.group_data_rows, 0, gl.RGB, gl.FLOAT, scene_data.group_children)
+
+    gl.bindTexture(gl.TEXTURE_2D, raytracer.group_objects_texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, scene_data.row_pad, scene_data.group_data_rows, 0, gl.RGB, gl.FLOAT, scene_data.group_objects)
+    
+    gl.bindTexture(gl.TEXTURE_2D, raytracer.group_hitmiss_texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, scene_data.row_pad, scene_data.group_data_rows, 0, gl.RGB, gl.FLOAT, scene_data.group_hitmiss)
+
+    gl.bindTexture(gl.TEXTURE_2D, raytracer.group_boxmin_texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, scene_data.row_pad, scene_data.group_data_rows, 0, gl.RGB, gl.FLOAT, scene_data.group_boxmin)
+
+    gl.bindTexture(gl.TEXTURE_2D, raytracer.group_boxmax_texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, scene_data.row_pad, scene_data.group_data_rows, 0, gl.RGB, gl.FLOAT, scene_data.group_boxmax)
+
+    gl.bindTexture(gl.TEXTURE_2D, null)
+
+    return true
+}
+
+function bind_texture(gl, unit, texture, uniform)
+{
+    gl.activeTexture(gl.TEXTURE0 + unit)
+    gl.bindTexture(gl.TEXTURE_2D, texture)
+    gl.uniform1i(uniform, unit)
+}
+
+identity_Matrix4fv = new Float32Array([
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0])
+
+framerate_keep = 10
+framerate_history = []
+framerate_average = -1
+framerate_last_date = new Date()
+
+raytracer = {}
+ 
+function reset_framerate()
+{
+    framerate_history = []
+    framerate_average = -1
+    framerate_last_date = new Date()
+}
+
+function add_framerate(d)
+{
+    var millis = d - framerate_last_date
+    if(framerate_history.length == 0) {
+        for(i = 0; i < framerate_keep; i++)
+            framerate_history.push(millis)
+        framerate_average = millis
+    }
+    var prev = framerate_history.shift()
+    framerate_average -= prev / framerate_keep
+    framerate_history.push(millis)
+    framerate_average += millis / framerate_keep
+    framerate_last_date = d
+}
+
+function draw_scene(gl, raytracer, scene_data, quiet)
+{
+    // var started = new Date()
+    // var ended = new Date()
+    // debug("ended - started = " + (ended - started))
+    gl.useProgram(raytracer.program)
+
+    var rendering = document.getElementById("rendering")
+    gl.viewport(0, 0, rendering.width, rendering.height)
+
+    var which_texture = 0
+
+    bind_texture(gl, which_texture++, raytracer.sphere_geometry_texture, raytracer.sphere_geometry_uniform)
+    bind_texture(gl, which_texture++, raytracer.sphere_colors_texture, raytracer.sphere_colors_uniform)
+
+    bind_texture(gl, which_texture++, raytracer.group_objects_texture, raytracer.group_objects_uniform)
+    bind_texture(gl, which_texture++, raytracer.group_hitmiss_texture, raytracer.group_hitmiss_uniform)
+    bind_texture(gl, which_texture++, raytracer.group_children_texture, raytracer.group_children_uniform)
+    bind_texture(gl, which_texture++, raytracer.group_boxmin_texture, raytracer.group_boxmin_uniform)
+    bind_texture(gl, which_texture++, raytracer.group_boxmax_texture, raytracer.group_boxmax_uniform)
+
+    gl.uniform1i(raytracer.tree_root_uniform, scene_data.tree_root)
+    gl.uniform1i(raytracer.sphere_data_row_size_uniform, scene_data.row_pad)
+    gl.uniform1i(raytracer.sphere_data_rows_uniform, scene_data.sphere_data_rows)
+    gl.uniform1i(raytracer.group_data_row_size_uniform, scene_data.row_pad)
+    gl.uniform1i(raytracer.group_data_rows_uniform, scene_data.group_data_rows)
+    gl.uniform3f(raytracer.eye_uniform, scene_data.eye.X, scene_data.eye.Y, scene_data.eye.Z)
+    gl.uniform1f(raytracer.fov_uniform, scene_data.fov)
+    gl.uniform1f(raytracer.aspect_uniform, 1.0)
+    gl.uniform3f(raytracer.background_color_uniform, scene_data.background[0], scene_data.background[1], scene_data.background[2])
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, raytracer.vert_buffer)
+    gl.vertexAttribPointer(raytracer.pos_attrib, 4, gl.FLOAT, gl.FALSE, 0, 0)
+    gl.enableVertexAttribArray(raytracer.pos_attrib)
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, raytracer.texcoord_buffer)
+    gl.vertexAttribPointer(raytracer.texcoord_attrib, 2, gl.FLOAT, gl.FALSE, 0, 0)
+    gl.enableVertexAttribArray(raytracer.texcoord_attrib)
+
+    gl.uniformMatrix4fv(raytracer.camera_matrix_uniform, gl.FALSE, scene_data.camera_matrix)
+    gl.uniformMatrix4fv(raytracer.camera_normal_matrix_uniform, gl.FALSE, scene_data.camera_normal_matrix)
+    gl.uniformMatrix4fv(raytracer.object_matrix_uniform, gl.FALSE, scene_data.object_matrix)
+    gl.uniformMatrix4fv(raytracer.object_inverse_uniform, gl.FALSE, scene_data.object_inverse)
+    gl.uniformMatrix4fv(raytracer.object_normal_matrix_uniform, gl.FALSE, scene_data.object_normal_matrix)
+    gl.uniformMatrix4fv(raytracer.object_normal_inverse_uniform, gl.FALSE, scene_data.object_normal_inverse)
+
+    gl.uniformMatrix4fv(raytracer.modelview_uniform, gl.FALSE, identity_Matrix4fv)
+    gl.uniform4f(raytracer.light_dir_uniform, light_dir.X, light_dir.Y, light_dir.Z, 0)
+
+    gl.clearColor(1, 0, 0, 1)
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+    // gl.finish() /* Chrome stutters really badly without this */
+    var err = gl.getError() // another way to force browser to flush
+    if(err != gl.NONE)
+        debug("GL Error : " + err)
+    add_framerate(new Date)
+    if(!quiet) {
+        document.getElementById("fps").innerHTML = (1000 / framerate_average).toFixed(2) + " fps"
+    }
+}
+
+buttondown = false
+
+ox = 0
+oy = 0
+
+var requestAnimationFrame = window.requestAnimationFrame ||
+    window.mozRequestAnimationFrame || window.webkitRequestAnimationFrame ||
+    window.msRequestAnimationFrame
+    window.requestAnimationFrame = requestAnimationFrame
+
+redraw_timer = false
+
+function mousedown(gl, raytracer, scene_data, ev)
+{
+    buttondown = true
+    ox = ev.layerX
+    oy = ev.layerY
+    reset_framerate()
+    redraw_timer = setInterval(function(){ draw_scene(gl, raytracer, scene_data) }, 15)
+}
+
+function mouseup(gl, raytracer, scene_data, ev)
+{
+    buttondown = false
+    if(redraw_timer) { clearInterval(redraw_timer); redraw_timer = false; draw_scene(gl, raytracer, scene_data) }
+}
+
+function mouseout(gl, raytracer, scene_data, ev)
+{
+    buttondown = false
+    if(redraw_timer) { clearInterval(redraw_timer); redraw_timer = false; draw_scene(gl, raytracer, scene_data) }
+}
+
+ROTATE_OBJECT=1
+ROTATE_LIGHT=2
+ZOOM_OBJECT=3
+motion_target = ROTATE_OBJECT
+
+// XXX for debugging 11/8/2013
+function keydown(gl, raytracer, scene_data, ev)
+{
+    if(String.fromCharCode(ev.keyCode) == 'A') {
+        scene_data.fov *= 1.05
+        draw_scene(gl, raytracer, scene_data)
+    }
+    if(String.fromCharCode(ev.keyCode) == 'S') {
+        scene_data.fov /= 1.05
+        draw_scene(gl, raytracer, scene_data)
+    }
+}
+
+function mousewheel(gl, raytracer, scene_data, ev)
+{
+    // delta regularization cribbed from http://www.javascriptkit.com/javatutors/onmousewheel.shtml
+    var evt=window.event || ev //equalize event object
+    var delta=evt.detail? evt.detail*(-120) : evt.wheelDelta //check for detail first so Opera uses that instead of wheelDelta
+
+    while(Math.abs(delta) > 0) {
+        step = (delta > 0) ? 120 : -120
+
+        var dwheel = 4 / step // 4 empirically chosen 
+        zoom *= Math.exp(dwheel)
+
+        if(Math.abs(step) > Math.abs(delta))
+            delta = 0
+        else
+            delta = delta - step
+    }
+    update_view_params(scene_data, zoom)
+    draw_scene(gl, raytracer, scene_data)
+    ev.preventDefault()
+    ev.stopPropagation()
+}
+
+function mousemove(gl, raytracer, scene_data, ev)
+{
+    dx = ev.layerX - ox
+    dy = ev.layerY - oy
+
+    if(buttondown && ((dx != 0) || (dy != 0))) {
+        var canvas = document.getElementById("rendering")
+        if(motion_target == ZOOM_OBJECT) {
+            zoom *= Math.exp(Math.log(5.0) / canvas.offsetHeight / 2 * -dy)
+        } else if(motion_target == ROTATE_OBJECT) {
+            object_rotation = trackball_motion(object_rotation, (dx / canvas.offsetWidth), (dy / canvas.offsetHeight))
+        } else {
+            // viewing coordinate system is left-handed, so using GL
+            // rotation code for light is backwards.
+            light_rotation = trackball_motion(light_rotation, -(dx / canvas.offsetWidth), -(dy / canvas.offsetHeight))
+        }
+        update_view_params(scene_data, zoom)
+        update_light()
+
+	// window.requestAnimationFrame(function() {draw_scene(gl, raytracer, scene_data)})
+    }
+    ox = ev.layerX
+    oy = ev.layerY
+}
+
+function cleanup_after_failure(s)
+{
+    var rendering = document.getElementById("rendering")
+    rendering.parentNode.removeChild(rendering)
+    var interaction_panel = document.getElementById("interaction_panel")
+    interaction_panel.parentNode.removeChild(interaction_panel)
+    document.getElementById("info").innerHTML = s + '<br>Try <a href="http://get.webgl.org/troubleshooting/">this page</a> for troubleshooting.)'
+}
+
+function set_half_res()
+{
+    var rendering = document.getElementById("rendering")
+    rendering.width = 256
+    rendering.height = 256
+    document.getElementById("resolution_list").selectedIndex = 0
+    if(window.scene_data)
+        draw_scene(window.gl, window.raytracer, window.scene_data)
+}
+
+function set_full_res()
+{
+    var rendering = document.getElementById("rendering")
+    rendering.width = 512
+    rendering.height = 512
+    document.getElementById("resolution_list").selectedIndex = 1
+    if(window.scene_data)
+        draw_scene(window.gl, window.raytracer, window.scene_data)
+}
+
+function set_double_res()
+{
+    var rendering = document.getElementById("rendering")
+    rendering.width = 1024
+    rendering.height = 1024
+    document.getElementById("resolution_list").selectedIndex = 2
+    if(window.scene_data)
+        draw_scene(window.gl, window.raytracer, window.scene_data)
+}
+
+// entire function cribbed from http://www.nczonline.net/blog/2009/07/28/the-best-way-to-load-external-javascript/
+function load_script(url, callback){
+
+    var script = document.createElement("script")
+    script.type = "text/javascript";
+
+    if (script.readyState){  //IE
+        script.onreadystatechange = function(){
+            if (script.readyState == "loaded" ||
+                    script.readyState == "complete"){
+                script.onreadystatechange = null;
+                callback();
+            }
+        };
+    } else {  //Others
+        script.onload = function(){
+            callback();
+        };
+    }
+
+    script.src = url;
+    document.getElementsByTagName("head")[0].appendChild(script);
+}
+
+function addListener(element, what, func, sendup)
+{
+    if (document.attachEvent) //if IE (and Opera depending on user setting)
+        element.attachEvent("on"+what, func)
+    else if (document.addEventListener) //WC3 browsers
+        element.addEventListener(what, func, true, sendup)
+}
+
+function removeListener(element, what, func)
+{
+    if (document.attachEvent) //if IE (and Opera depending on user setting)
+        element.detachEvent("on"+what, func)
+    else if (document.addEventListener) //WC3 browsers
+        element.removeEventListener(what, func, true)
+}
+
+function disable_interaction()
+{
+    document.getElementById("interaction_list").disabled = true
+    document.getElementById("resolution_list").disabled = true
+    document.getElementById("models_list").disabled = true
+
+    var rendering = document.getElementById("rendering")
+    if(document.mousedown) {
+        removeListener(rendering, "mousedown", document.mousedown)
+        removeListener(rendering, "mousemove", document.mousemove)
+        removeListener(rendering, "mouseup", document.mouseup)
+        removeListener(rendering, "mouseout", document.mouseout)
+        removeListener(rendering, window.mousewheelevt, document.mousewheel)
+        document.mousedown = false
+    }
+}
+
+function enable_interaction(gl, raytracer, scene_data)
+{
+    var rendering = document.getElementById("rendering")
+
+// XXX for debugging 2013/8/11
+    document.onkeydown = function(ev){keydown(gl, raytracer, scene_data, ev)}
+
+    document.mousedown = function(ev){mousedown(gl, raytracer, scene_data, ev)}
+    document.mousemove = function(ev){mousemove(gl, raytracer, scene_data, ev)}
+    document.mouseup = function(ev){mouseup(gl, raytracer, scene_data, ev)}
+    document.mouseout = function(ev){mouseout(gl, raytracer, scene_data, ev)}
+    document.mousewheel = function(ev){mousewheel(gl, raytracer, scene_data, ev)}
+    addListener(rendering, "mousedown", document.mousedown, true)
+    addListener(rendering, "mousemove", document.mousemove, true)
+    addListener(rendering, "mouseup", document.mouseup, true)
+    addListener(rendering, "mouseout", document.mouseout, true)
+
+    addListener(rendering, window.mousewheelevt, document.mousewheel, false)
+
+    rendering.ondragstart = function() { return false }
+
+    document.getElementById("interaction_list").disabled = false
+    document.getElementById("resolution_list").disabled = false
+    document.getElementById("models_list").disabled = false
+}
+
+function finish_successful_model_load(name)
+{
+    scene_data.name = name
+
+    var rendering = document.getElementById("rendering")
+    var gl = window.gl
+    success = load_scene_data(scene_data, gl, raytracer)
+    if(!success){
+        cleanup_after_failure('Could not initialize WebGL with application data. Please email <a href="mailto:grantham@plunk.org">Brad</a>.')
+        return
+    }
+
+    update_view_params(scene_data, zoom)
+    update_light()
+
+    enable_interaction(gl, raytracer, scene_data)
+
+    draw_scene(gl, raytracer, scene_data)
+}
+
+function start_model_load(name)
+{
+    disable_interaction()
+    scene_data = {}
+    document.getElementById("models_list").selectedIndex = model_list[name].index
+    load_script(name, function() {finish_successful_model_load(name)} )
+}
+
+model_list = {
+    "caffeine.js" : {name: "Caffeine"},
+    "dna.js" : {name: "DNA fragment"},
+    "gears.js" : {name: "Atomic Gears"},
+    "inits.js" : {name: "Brad's Initials"},
+    "large-bearing.js" : {name: "Molecular Bearing"},
+    "sortingpump.js" : {name: "Molecular Sorting Pump"},
+    "sphereflake.js" : {name: "SphereFlake"},
+    "tbv.js" : {name: "Tomato Bushy Virus"},
+}
+
+function finish_characterization(name)
+{
+    var rendering = document.getElementById("rendering")
+    var gl = window.gl
+
+    draw_scene(gl, raytracer, scene_data, true)
+    var pixelValues = new Uint8Array(4);
+    gl.readPixels(10, 35, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixelValues);
+
+    var test_frames = 20
+    var started = new Date()
+    for(var i = 0; i < test_frames; i++) {
+        draw_scene(gl, raytracer, scene_data, true)
+    }
+    var pixelValues = new Uint8Array(4);
+    gl.readPixels(10, 35, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixelValues);
+    var ended = new Date()
+    var millis = (ended.getTime() - started.getTime())
+    var fps = (test_frames / (millis / 1000))
+    // debug(test_frames + "x of " + name + " yields " + fps + " fps")
+
+    if(fps > 857) {
+        set_double_res()
+        start_model_load("sorting_pump.js")
+    } else if(fps > 414) {
+        set_double_res()
+        start_model_load("gears.js")
+    } else if(fps > 353) {
+        set_double_res()
+        start_model_load("tbv.js")
+    } else if(fps > 214) {
+        set_double_res()
+        start_model_load("sphereflake.js")
+    } else if(fps > 82) {
+        start_model_load("large-bearing.js")
+    } else if(fps > 22) {
+        start_model_load("dna.js")
+    } else if(fps > 10) {
+        set_half_res()
+        start_model_load("dna.js")
+    } else if(fps > 6) {
+        start_model_load("caffeine.js")
+    } else if(fps > 2.86) {
+        set_half_res()
+        start_model_load("caffeine.js")
+    } else if(fps > 2.00) {
+        set_half_res()
+        start_model_load("dna.js")
+    } else {
+        alert("This page calculated that this raytracer will be very slow on your configuration. Don't expect models to be interactive.")
+        set_half_res()
+        start_model_load("inits.js")
+    }
+}
+
+function continue_characterization(name)
+{
+    scene_data = window.scene_data
+    console.log("loading " + name + " for characterization")
+    scene_data.name = name
+
+    var rendering = document.getElementById("rendering")
+    var gl = window.gl
+    success = load_scene_data(scene_data, gl, raytracer)
+    if(!success){
+        cleanup_after_failure('Could not initialize WebGL with application data. Please email <a href="mailto:grantham@plunk.org">Brad</a>.')
+        return
+    }
+
+    update_view_params(scene_data, zoom)
+    update_light()
+
+    draw_scene(gl, raytracer, scene_data, true)
+    gl.finish()
+
+    setTimeout(function(){finish_characterization(name)}, 100)
+}
+
+function start_characterization(name)
+{
+    disable_interaction()
+    load_script(name, function() {continue_characterization(name)} )
+}
+
+function change_interaction()
+{
+    interaction_list = document.getElementById("interaction_list")
+    selection = interaction_list.selectedIndex
+    value = interaction_list.options[selection].value
+    if(value == "rotate_object")
+        motion_target = ROTATE_OBJECT
+    else if(value == "zoom_object")
+        motion_target = ZOOM_OBJECT
+    else if(value == "rotate_light")
+        motion_target = ROTATE_LIGHT
+}
+
+function change_resolution()
+{
+    resolution_list = document.getElementById("resolution_list")
+    selection = resolution_list.selectedIndex
+    value = resolution_list.options[selection].value
+    if(value == "half")
+        set_half_res()
+    else if(value == "full")
+        set_full_res()
+    else if(value == "double")
+        set_double_res()
+}
+
+function change_model()
+{
+    models_list = document.getElementById("models_list")
+    selection = models_list.selectedIndex
+    start_model_load(models_list.options[selection].value)
+}
+
+function init()
+{
+    // cribbed next line from http://www.javascriptkit.com/javatutors/onmousewheel.shtml
+    window.mousewheelevt=(/Firefox/i.test(navigator.userAgent))? "DOMMouseScroll" : "mousewheel" //FF doesn't recognize mousewheel as of FF3.x
+
+    models_list = document.getElementById("models_list")
+    var index = 0
+    for(var file in model_list) {
+        var option = document.createElement("option");
+        option.value = file
+        option.text = model_list[file]['name']
+        model_list[file].index = index
+        models_list.add(option)
+        index ++
+    }
+     
+    zoom = 1.0
+    disable_interaction()
+
+    light_rotation[0] = to_radians(20.0)
+    light_rotation[1] = .707
+    light_rotation[2] = -.707
+    light_rotation[3] = 0
+
+    var success = false
+    var rendering = document.getElementById("rendering")
+    try {
+        var gl = rendering.getContext("experimental-webgl", {preserveDrawingBuffer: true})
+        window.gl = gl
+        if (!gl) {
+            cleanup_after_failure('Could not initialize WebGL.  Does your web browser support WebGL?')
+            return
+        }
+
+	alw = gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE)
+	probably_angle = (alw[0] == 1) && (alw[1] == 1)
+	is_windows = navigator.platform=="Win32"
+	is_chrome = false
+	is_firefox = false
+	if ((v=navigator.userAgent.indexOf("Chrome"))!=-1) {
+	    is_chrome = true
+	    ver = navigator.userAgent.substring(v+7)
+	    chromemajor = ver.substring(0,ver.indexOf("."))
+	}
+	if ((v=navigator.userAgent.indexOf("Firefox"))!=-1) {
+	    is_firefox = true
+	    ver = navigator.userAgent.substring(v+8)
+	    firefoxmajor = ver.substring(0,ver.indexOf("."))
+	}
+
+	chrome_angle_link_timeout = probably_angle && is_windows && is_chrome && (chromemajor <= 30)
+        if(chrome_angle_link_timeout) {
+	    gRayTracingFragmentShaderText = gRayTracingFragmentShaderText.replace("max_bvh_iterations = 400","max_bvh_iterations = 150")
+	    document.getElementById("rendering_info").style.width = "320px"
+	    document.getElementById("rendering_info").innerHTML = '<center>Your Browser appears to be a Windows version of Chrome using ANGLE.<br><br>The raytracer inner loop has been truncated to avoid a link timeout and rendering may show artifacts.<br><br>Try restarting Chrome from the command-line with the parameter <code>"--use-gl=desktop"</code> for the full shader, but my experience was that native GL was substantially slower to render.  See also <a href="http://www.geeks3d.com/20130611/webgl-how-to-enable-native-opengl-in-your-browser-windows/">this page.</a></center>'
+	}
+	firefox_webgl_hang = is_windows && is_firefox && (firefoxmajor >= 24)
+	if(firefox_webgl_hang) {
+            cleanup_after_failure('This script detected Windows Firefox version 24 or later, and at Firefox 24 or later on Windows hangs running this shader.  Therefore the raytracer is disabled, sorry.  Please see <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=919886">Firefox issue 919886</a>')
+	    return
+	}
+
+        var tf = gl.getExtension("OES_texture_float")
+        if(!tf) {
+            cleanup_after_failure('This application requires the WebGL "OES_texture_float" extension, but your browser or platform doesn\'t offer that extension.')
+            return
+        }
+    } catch (err) {
+        debug(err)
+        cleanup_after_failure('Could not initialize WebGL.  Does your web browser support WebGL?')
+        return
+    }
+
+    window.raytracer = init_raytracing_program(gl)
+    if(!window.raytracer){
+        cleanup_after_failure('Could not initialize WebGL with shaders. Please email <a href="mailto:grantham@plunk.org">Brad</a>.')
+        return
+    }
+
+    start_characterization("caffeine.js")
+}
+
+// setTimeout(init, 100)
+
+// -->
+</script>
+
+<head>
+<title>
+Bringing a 1987 Ray Tracer Up-To-Date
+</title>
+<link rel="image_src" href="caffeine_thumb.png">
+
+<link href="stylesheet.css" rel="stylesheet" type="text/css">
+</head>
+
+<body onload="init()">
+
+<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+<!-- graphics -->
+<ins class="adsbygoogle"
+     style="display:inline-block;width:728px;height:90px"
+     data-ad-client="ca-pub-8371436215793925"
+     data-ad-slot="8213038781"></ins>
+<script>
+(adsbygoogle = window.adsbygoogle || []).push({});
+</script>
+
+<h1>Introduction</h1>
+
+<p>I wrote a ray-tracer in C on an Amiga in 1987, when I was in high school, for a science fair project.  Here's an image captured from an emulator in May of 2013, thanks to my brother, <a href="http://bartgrantham.com">Bart Grantham</a>.  He ran the original executable to save this image.</p>
+
+<table width="100%">
+<tr>
+<td>
+<center>
+<img src="inits.png">
+</center>
+</td>
+</tr>
+<tr>
+<td>
+<center>
+<div style="width:576px">
+<i>This is an image from a 26-Year-Old AmigaDOS Executable.  It would have taken all night to render in 1987.</i>
+</div>
+</center>
+</td>
+</tr>
+</table>
+
+<br>
+<br>
+
+<a name="webglrt"></a>
+<center>
+<table>
+<tr>
+<td>
+<canvas id="rendering" width="512" height="512" style="width: 512px; height: 512px;border:1px solid #d3d3d3;">
+Your browser does not support the HTML5 canvas tag.</canvas>
+</td>
+<td id="rendering_info" width="0%"></td>
+</tr>
+<tr>
+<td>
+<center>
+<i>
+This is an interactive ray-tracer.<br>
+Click and drag with left button.<br>
+Mouse/Trackpad scrollwheel zooms.<br>
+</i>
+<div id="interaction_panel">
+
+<select id="interaction_list" onchange="change_interaction()">
+<option value="rotate_object" selected>Rotate Object</option>
+<option value="zoom_object">Zoom Object</option>
+<option value="rotate_light">Rotate Light</option>
+</select>
+
+<select id="resolution_list" onchange="change_resolution()">
+<option value="half">Half Resolution</option>
+<option value="full" selected>Full Resolution</option>
+<option value="double">Double Resolution</option>
+</select>
+
+<select id="models_list" onchange="change_model()"></select>
+
+<div id="fps"></div>
+</center>
+</div>
+</td>
+</tr>
+</table>
+<div id="debug"></div>
+<div id="info"></div>
+</center>
+
+<h1>Groundwork</h1>
+
+<p>I was one of the generation of programmers who grew up and discovered personal computers as the term was being invented.  We had a <a href="http://en.wikipedia.org/wiki/TRS-80">TRS-80 Model II<a>, then a <a href="http://en.wikipedia.org/wiki/Texas_Instruments_TI-99/4A">TI 99/4A</a>, then an <a href="http://en.wikipedia.org/wiki/Apple_IIe">Apple //e</a>, then an <a href="http://en.wikipedia.org/wiki/Amiga_500">Amiga 500</a>.  I learned how to program in various dialects of <a href="http://en.wikipedia.org/wiki/Applesoft_BASIC">BASIC</a> and had a little success with assembly language.</p>
+
+<p>I saw Tron in 1982 in the theater and was thrown.  Computers could make images like that?  I wanted to learn how.  I was 12; I was full of excitement and energy but not very focused and didn't really know how to systematically learn the things I needed to learn.  I looked around at computer graphics books at the library, not understanding much about the algorithms.  I asked other middle school students about "cosine" and "sine," and how they and other things worked.  At that age most kids wouldn't have known cosine from a hole in the ground.</p>
+
+<p>I had the coffee table book <a href="http://www.amazon.com/Creative-Computer-Graphics-Annabel-Jankel/dp/0521262518">Creative Computer Graphics</a>, bought on a trip to the Smithsonian.  In it were the promise of rich images created entirely by computers.  One of the fascinating things to me about that book now is the diversity of images, running the gamut from interactive line rendering for CAD to entertainment to flight simulators.</p>
+
+<p>In fact, we had the <a href="http://en.wikipedia.org/wiki/SubLOGIC">subLOGIC</a> flight simulator <a href="http://fshistory.simflight.com/fsh/fs1.htm">FS1</a> on our Apple //e, which amazingly drew a 3D view of (admittedly very simple) terrain interactively.  I think this is what made me wonder how straight lines were drawn on a screen using pixels.</p>
+
+<p>I started high school in 1984 and spent a lot of my time playing on the Apple //e, writing little bits of BASIC code.  I got as far as writing a line-drawing routine in assembler (which never did quite work right), and some assembly routines that could save bits from the cassette port and play them back to the speaker.</p>
+
+<p>When Christmas 1986 brought us an Amiga 500, of course we were dazzled by the Amiga "Boing" demo.  But what really gave me momentum was <a href="http://home.comcast.net/~erniew/juggler.html">"the Juggler" by Eric Graham</a>, which came out in 1987 and I probably saw later that year.</p>
+
+<p>I needed to do find out if I could do that same thing.</p>
+
+
+<h1>Design and Implementation</h1>
+
+<p>We had a copy of the <a href="http://en.wikipedia.org/wiki/Aztec_C">Aztec C</a> compiler (probably version 1 or 2).  I seem to remember not having much in the way of documentation for Aztec C, but rather had the published books for AmigaDOS' runtime, including the Intuition programming interface.</p>
+
+<p>But the most sophisticated feature of AmigaDOS that I used was just <a href="http://en.wikipedia.org/wiki/Hold-And-Modify">HAM mode<a>.</p>
+
+
+<h2>Basic operation</h2>
+
+<p>The data file format represents only matte colored spheres, and looks something like this:</p>
+
+<center>
+<table border="1" cellpadding="10">
+<tr><th>File Contents</th><th>Meaning</th></tr>
+<tr>
+<td>
+<pre>
+Some spheres
+0;80;50
+2;2
+15;15;15;20;7
+3
+30;5;30;5;15;15;0;80
+30;10;30;5;15;15;0;80
+30;15;30;5;15;15;0;80
+18;15;-40
+0;0;0
+40
+</pre>
+</td>
+<td>
+<pre>
+Title line
+interlace, width, height
+X and Y subsampling
+background color and randomness
+number of spheres
+x, y, z, r, then color
+...
+...
+eye x, y, z
+yaw, pitch, roll
+field of view angle
+</pre>
+</td>
+</tr>
+</table>
+</center>
+
+<p>The program read all of this with a very simple tokenizer into a structure allocated on the heap, rendered the image to the screen, and then waited.  I think I must have used a screenshot tool to copy the output to disk if I saved any images at all, as I don't see image saving in the source.</p>
+
+<p><a href="inits.ray">Here's the data file</a> for just my first initial.</p>
+
+<p>Operation is pretty straightforward; rays are generated for each pixel, those rays are tested against every sphere in the scene, and then the closest hit is shaded with the Z component of the normal at that hit.  The shading is thus just Lambertian, assuming a light behind the viewer, infinitely far away.  Spheres couldn't be transformed, meaning they couldn't be squashed or stretched.</p>
+
+<p>I used HAM mode in order to maximize my color palette.  In HAM mode, during scanout left-to-right, each pixel could change the 4-bit red, green, or blue portion of the currently displayed 12-bit color.   While rendering, I kept track of the currently drawn color and updated only the components that had changed.  In practice, two or three of the components changed often, so the image has a kind of horizontal smeared quality to it.</p>
+
+<p>There are no reflections, no shadows, no infinite planes with checkboards, no texturing, and no polygons.  <a href="http://www.kevinbeason.com/smallpt/">Kevin Beason wrote a sphere path-tracer in 99 lines of C++</a> (which is pretty amazing) but I think what I did was reasonable for 500 lines of clumsy C written when I was 16.</p>
+
+<h2>Notable features</h2>
+
+
+<h3>Camera</h3>
+
+<p>I didn't have a good understanding of an "image plane" or a "camera model" at the time.  I thought that camera rays were generated by dividing the field of view into equal angles in X and Y.  It's probably closest to an <a href="http://en.wikipedia.org/wiki/Fisheye_lens#Fisheye_lens">equidistant fisheye lens projection</a>, but it's essentially latitude and longitude lines on a sphere.  I realize now that the visualization in my head at the time of what the math was doing was not quite right.</p>
+
+<center>
+<table>
+<tr>
+<td>
+<img src="Brad's Projection.png">
+</td>
+<td>
+<img src="OpenGL Projection.png">
+</td>
+</tr>
+</table>
+</center>
+
+<p>There were several things that seemed suspicious to me even then; what happens when the field of view angle is near or greater than 180 degrees; what if the Y field of view is very tall but the X field is very narrow?  I don't think I ever rendered any field of view beyond 40 degrees.</p>
+
+<p>I combined that with the idea of camera yaw (rotation around Y), pitch (rotation around rotated X), and roll (rotation around the subsequent view direction).  These implement three gimbals.</p>
+
+<p>I never generated enough images to test it, but it turns out the camera model in the code almost works.  Turning left and right (yaw) works fine.  The projection appears fine for small to medium angles and has the odd characteristic of a given sphere at a given distance from the eye having equal area no matter where it falls in image X and Y.</p>
+
+<p>OpenGL samples the image plane on a rectangular grid.  This better matches display on a flat monitor, like an LCD.  But the perspective projection in OpenGL distorts shapes at the outside of the image angles, if the angle the image subtends on the display device from the viewer is not the same as the field of view in the camera model.</p>
+
+<p>I did have the notion of aspect ratio.  I think the above image was more-or-less correct on the monitor I had at the time.</p>
+
+<p>In any case, it turns out that my camera ray generation code was actually broken.  Tilting up or down really distorted the image, and rolling had some kind of trig error and really just didn't work.</p>
+
+
+<h3>Shading Randomization</h3>
+
+<p>I guess I knew at the time that I wanted to move beyond simple shading.  However, I knew bump-mapping, anisotropy, and distribution ray-tracing were beyond my understanding at the time, so I simply added a random value to the shaded color.  This simple technique did add visual detail and looked better to my eyes, and added an interesting character to the images in combination with HAM mode.</p>
+
+<p>These days you can see the value of path-tracing, texturing, BRDF, and area light sources on the beauty of synthetic images, in which noise matches the actual energy distribution in the scene.  I rendered the following image with a different raytracer I wrote later.</p>
+
+<table width="100%">
+<tr>
+<td>
+<center>
+<img src="glossy.jpg">
+</center>
+</td>
+</tr>
+<tr>
+<td>
+<center>
+<i>Ray-tracing with glossy surfaces<i>
+</center>
+</td>
+</tr>
+</table>
+
+<h3>Supersampling</h3>
+
+<p>Finally, I think at the time it was apparent that the edges of objects would have jaggies (aliasing) so I had a supersampling factor for both X and Y.  The noisiness of HAM pixels probably overwhelmed that.</p>
+
+
+<h2>Assessment</h2>
+
+<p>Unfortunately I'm missing a machine-readable version of a few of
+the files.  But <a href="sphray.c">here's main() and the most significant functions</a>.  It's what you'd expect from a 16-year-old who just learned C; a couple of errors, no spaces around operators, cryptic error messages, gotos...</p>
+
+<h1>Restoring</h1>
+
+<p>I set about bringing this relic to life, mostly out of curiosity.</p>
+
+<p><a href="sphray.new.cpp">Here's source</a> for the restored command-line renderer.</>
+
+<table width="100%">
+<tr>
+<td>
+<center>
+<img src="inits.jpg">
+</center>
+</td>
+</tr>
+<tr>
+<td>
+<center>
+<i>
+26 Years Later...
+</i>
+</center>
+</td>
+</tr>
+</table>
+
+<p>I ported the code to C++ and libc and abandoned windowed output in favor of the very simple PNM image file format.  I had to replace AllocMem with new (and malloc in a couple of instances) and FreeMem with delete and free.  I added an OpenMP pragma to optimize the pixel loop.  This took just a couple of hours.  It was really gratifying to see new pixels made from code that was largely still 26 years old.  And it took just seconds for a 512 by 512 image; back in high school a 320 by 200 image took many hours.  It was a relief to know that I could look at my my old code, which had taken me months to write, and port it and bring it up to date in just hours.</p>
+
+
+<h1>Interactivity</h1>
+
+<p>With a working version the program in hand, I thought it would be fun to push it a little further.</p>
+
+<p>I left much of the old code in place and used much of the 26-year-old style.</p>
+
+<p>You can <a href="glesray1.tar.bz2">have the code if you'd like</a>, as a reference.</p>
+
+
+<h2>Restrictions</h2>
+
+<p>I limited myself to the spirit of the intersection code, shading method, projection model, and camera model I used 26 years ago.  I guess I wanted to imagine what had happened if I had decided "okay, this is good" and then went on to add more optimization and more features.  I wanted to be able to use the original inits.ray data file that I still had lying around, and then create more models using the same format that I could potentially have read with the original program.  In this way I can squint and pretend that this was where I was headed if I had stayed focused.</p>
+
+
+<h2>BVH</h2>
+
+<p>I added a simple bounding volume hierarchy.</p>
+
+<p>First the BVH construction code finds the centroid of the current set of spheres by averaging their centers.</p>
+
+<center>
+<img src="BVH centroid.png">
+</center>
+
+<p>The algorithm makes a split plane from the centroid and the axis which has the largest extent in the axis-aligned bounding box containing the current set of spheres.</p>
+
+<center>
+<img src="BVH split plane.png">
+</center>
+
+<p>The algorithm creates two new lists of spheres whose centers lie in the half-spaces on either side of the plane.</p>
+
+<center>
+<img src="BVH split.png">
+</center>
+
+<p>Construction recurses on those two lists, making leaf nodes when a list is smaller than a predefined maximum number of spheres, or at a predefined maximum number of levels.  The maximum depth restriction takes precedence, so leaf nodes could contain many spheres.</p>
+
+<center>
+<img src="BVH recursion.png">
+</center>
+
+<p>Leaf nodes contain the list of spheres to trace..</p>
+
+<p>Every node in the hierarchy has an axis-aligned bounding box that contains of all the spheres of its children.  The bounding boxes of the two children of a branching node may actually overlap each other, and this is okay as long as they the volumes are getting progressively smaller.</p>
+
+<center>
+<img src="BVH tree.png">
+</center>
+
+<p>During intersection, each node checks to see that the ray intersects the node's bounding box.  If it does not, then it terminates.  If it does, then it traverses the node's children.  In C++, the traversal of the BVH is depth-first, using a stack.  In the fragment shader, I used "ropes" (<a href="http://graphics.cs.uni-sb.de/fileadmin/cguds/papers/2007/popov_07_GPURT/Popov_et_al._-_Stackless_KD-Tree_Traversal_for_High_Performance_GPU_Ray_Tracing.pdf">Popov et al, 2007</a>) to avoid using a stack, since a stack caused very high register usage and thus very few threads can be active at a time.</p>
+
+
+<h2>Mouse Control</h2>
+
+<p>The existing eye position and orientation from the file is discarded and a new one created that places the eye at Z with the scene fully in view.  The mouse rotates the camera and light using simple trackball math.</p>
+
+<p>While working on this, I fixed the bug in the camera ray generation which distorted the image when the pitch angle wasn't 0.  (Oldest bug I've ever fixed, I think.)</p>
+
+
+<h2>OpenGL</h2>
+
+<p>The program can render on the CPU and copy to a GL texture and just render a textured quad, or it can render on the GPU entirely using a GLSL 3.00 shader to traverse the BVH tree, intersect the spheres, and shade them.  I limited myself to OpenGL 3 Core Profile, in anticipation of possibly running in OpenGL ES 2 later.</p>
+
+<h2>Shading</h2>
+
+<p>The original implementation only removed hidden surfaces, showing off no other effects that ray-tracing does well.  So in the interactive C++ version I added shadows.  This required some enhancements to the code; in particular, I snap intersection points to the surface of the intersected sphere in order to reduce self-shadowing effects.</p>
+
+<h2>More Models</h2>
+
+<p>I converted some existing models I had in a format for another ray-tracer I'd written.  I also wrote a converted from the widely-available <a href="http://www.wwpdb.org/documentation/format33/v3.3.html">PDB format</a> to the old format.  The "large-bearing" and "gears" images are courtesy Mark Sims at Nanorex, and the caffeine, DNA, and tomato bushy virus are from PDB.  Here are some JPEG images of these models, and a .zip of the models is <a href="models.tar.bz2">here</a>.</p>
+
+<center>
+<table cellpadding="20">
+
+<tr>
+<td>
+    <table>
+    <tr> <td> <center> <img src="caffeine.jpg"> </center> </td> </tr>
+    <tr> <td> <center> <i>Caffeine from PDB</i> </center> </td> </tr>
+    </table>
+</td>
+<td>
+    <table>
+    <tr> <td> <center> <img src="dna.jpg"> </center> </td> </tr>
+    <tr> <td> <center> <i>DNA from PDB</i> </center> </td> </tr>
+    </table>
+</td>
+<td>
+    <table>
+    <tr> <td> <center> <img src="tbv.jpg"> </center> </td> </tr>
+    <tr> <td> <center> <i>Tomato Bushy Virus from PDB</i> </center> </td> </tr>
+    </table>
+</td>
+</tr>
+
+</table>
+<table cellpadding="20">
+
+<tr>
+<td>
+    <table>
+    <tr> <td> <center> <img src="large-bearing.jpg"> </center> </td> </tr>
+    <tr> <td> <center> <i>Large Molecular Bearing<br>courtesty Mark Sims, Nanorex</i> </center> </td> </tr>
+    </table>
+</td>
+<td>
+    <table>
+    <tr> <td> <center> <img src="gears.jpg"> </center> </td> </tr>
+    <tr> <td> <center> <i>Molecular Gearbox<br>courtesy Mark Sims, Nanorex</i> </center> </td> </tr>
+    </table>
+</td>
+</tr>
+
+</table>
+
+</center>
+
+<p>I also generated a 10K sphere dataset and 4M sphere dataset to test performance and resource limits.</p>
+
+
+<h2>Performance</h2>
+
+<p>All of these models are interactive in CPU-only mode on a 4-core laptop (Q820 at 1.7GHz).</p>
+
+<p>Performance on my GPU (Quadro FX 380M) is close to that of the CPU but the GPU is outpaced further and further as the model complexity goes up.  On other GPUs (e.g. whatever NVIDIA model is in the MacBook Pro Retina) the GPU renders faster than the CPU.  I've put some work into optimizing the shader but mostly I rely on the compiler for optimization.  I don't do much to improve SIMD utilization but since most of my rays are either from the eye or to the light source, they are fairly coherent.  </p>
+
+
+<h1>WebGL</h1>
+
+<p>Finally, it seemed to me that this code's journey would only be complete if it was visible to any viewer with a capable web browser.  <a href="#webglrt">It's at the top of this page.</a>  I wrote a C++ program to produce Javascript for the OpenGL textures that encapsulate the spheres and BVH.  I ported the main loop of my GLUT program to Javascript and passed the texture data and shader to WebGL.  For fun I also threw in one reflection bounce and a shadow occlusion test at the reflection hit.  Because there's a wide range of WebGL performance out there, the script runs a rudimentary performance characterization and tries to show the most complicated model that is most likely to run at 5 fps on your machine.</p>
+
+
+<p>WebGL is based on OpenGL ES 2.0 and specifically mandates that implementations must <a href="http://www.khronos.org/registry/webgl/specs/latest/#4.3"><i>only</i></a> accept shaders conforming to the minimum GLSL ES 1.00 specification.  That means constant-length for-loops and no while-loops or do-loops.  Luckily for me, the "continue" and "break" and "return" keywords are allowed.  (These restrictions allow a finite-size unrolled GPU instruction stream containing only forward branching as flow control.)</p>
+
+<p>My bounding volume hierarchy is an arbitrary depth and not perfect binary tree, traversal doesn't visit every node, and nodes contain variable-sized arrays of objects.  Those don't map directly to constant-length loops!  I made a large constant for the outer BVH tree traversal and "return" out of it when terminating, and I use a smaller constant for the leaf-node object loops and "break" when hitting the end of the object list.  One could probably algorithmically determine the constant needed for the BVH traversal based on the worst-possible ray path.  I just used inspection for this document.</p>
+
+<p>WebGL also doesn't provide any extension at this time for integer textures (where the components are read by shaders as integer components and not normalized) so I stored all my values as floats instead.  I can't exactly represent any integers larger than 2^24 and my models and hierarchy are limited by that.  Thus I couldn't have any more than four million spheres nor a BVH with more than four million nodes.  Four million spheres wouldn't be interactive on my laptop on WebGL, so I'm okay with that.</p>
+
+<p>After all this, I also found WebGL implementations vary in some frustrating ways.</p>
+
+<p>I started development on my laptop, under Linux, with an NVIDIA GPU.  NVIDIA's compiler is pretty forgiving, which makes porting to a stricter compiler a little painful.  I found I could not have a variable with the same name as its struct on any other compiler.  For example, "inout ray ray" failed on MacOSX.  Presumably the GLSL ES spec is clear about this but there's not much incentive to be more strict if a vendor already handles a superset.  The error message was also nonsensical, pointing to an empty line and stating only "syntax error syntax error", so that made it very hard to debug.  </p>
+
+<p>Chrome on Windows times out on linking my shaders together when I have a larger outer loop count (this appears to be Chrome issue <a href="http://code.google.com/p/chromium/issues/detail?id=113009">113009</a>, which is noted will be fixed by Chrome 30 but wasn't fixed in 30 for me...).  I assume many viewers of this web page will use Chrome on Windows, so I reduced my BVH loop size on Chrome but the larger models probably will not look right.</p>
+
+<p>Firefox 24 hangs completely running this page.  This is filed as Firefox Issue <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=919886">919886</a>.</p>
+
+<p>Chrome on Android on my Galaxy Nexus starts to render, but appears to time out.  (I am pretty impressed I may be able to run my WebGL app on my phone, though.)  Other phones and tablets either don't support float textures or high precision floats, and I'm just not willing to shoehorn my code into platforms that limited.</p>
+
+
+<h1>Future directions</h1>
+
+<p>The existing code can visualize molecular models of moderate size in many web browsers, so it actually has some use.  With a little work, I could build a browser for one or more repositories of PDB files.  Although I'm pretty pleased with the result of a few month's tinkering, this isn't much more than a toy.  PDB files these days are statically rendered with more sophisticated methods than a bunch of reflective spheres, but this could be an interactive camera placement tool on the front end of a high-quality renderer.</p>
+
+<p>There's been a lot of work in interactive ray-tracing over the years.  There are a couple dozen ways to relatively quickly improve this program.  If I didn't have a day job, I'd import more sophisticated models including textured triangles, optimize it more heavily using SSE and packets, add shaders for surface properties, move to WebCL, implement Metropolis Light Transport, etc.</p>
+
+
+<h1>Conclusion</h1>
+
+<p>Looking back on what I wrote then, I'm sort of a weird combination of embarrassed and pleased.  I was able to update that 26-year-old C pretty quickly to relatively modern data structures and technologies by reading papers and checking documentation.</p>
+
+<p>Should I have tried harder back then to implement from papers and other people's work, rather than try and figure things out for myself?  Maybe the skills I have now only developed because I struggled through and internalized those early concepts, rather than just porting from a paper.  Or maybe I didn't go as far as I could because I wasted time on incomplete or incorrect understanding of the concepts.  I am not sure how I would assess that now.</p>
+
+<p>The advice I would give myself at 16 (or any other 16-year-old, or any person anywhere) would be to learn how to make a plan and stick to it, make priorities and honor them, and read the documentation and papers more thoroughly.</p>
+
+</body>
+</html>
