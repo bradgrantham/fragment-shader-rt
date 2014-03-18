@@ -25,12 +25,14 @@
 #include <sys/time.h>
 #include <vector>
 #include <limits>
-
-const bool debug_gl = false;
+#include <GL/freeglut.h>
+#include "world.h"
 
 #define GL3_PROTOTYPES
 #include <GL3/gl3.h>
 #define __gl_h_
+
+const bool debug_gl = false;
 
 void query_log(void)
 {
@@ -52,10 +54,6 @@ void query_log(void)
         delete[] message;
     }
 }
-
-#include <GL/freeglut.h>
-
-#include "world.h"
 
 int gWindowWidth, gWindowHeight;
 unsigned char *gImage;
